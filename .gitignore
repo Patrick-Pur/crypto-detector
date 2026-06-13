@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+main_backup.py
+main_v2.py
+bullish_early_signals.csv
