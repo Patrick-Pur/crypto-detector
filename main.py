@@ -4,12 +4,19 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
+import hashlib
+import json
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 
 # ============================================================
@@ -75,6 +82,32 @@ ASSET_NAVIGATION = (
         ),
     },
 )
+
+# Erste Chatbot-Version: bewusst auf feste Beispiel-Fragen begrenzt.
+# Weitere Fragen oder ein freies Texteingabefeld können später ergänzt werden,
+# ohne die Datenmodelle der Asset-Seiten neu zu strukturieren.
+ASSISTANT_DEFAULT_MODEL = "gpt-5.4-mini"
+ASSISTANT_MAX_API_CALLS_PER_SESSION = 6
+ASSISTANT_QUESTIONS = {
+    "bitcoin": (
+        {"id": "status", "label": "Wie ist der aktuelle BTC-Status einzuordnen?"},
+        {"id": "missing", "label": "Welche Bedingungen fehlen aktuell bis zum EARLY-Signal?"},
+        {"id": "scores", "label": "Wie unterscheiden sich Setup- und Bestätigungs-Score?"},
+    ),
+    "spacex": (
+        {"id": "status", "label": "Wie ist das aktuelle SpaceX-Setup einzuordnen?"},
+        {"id": "missing", "label": "Welche Kriterien fehlen für ein konstruktiveres Einstiegsfenster?"},
+        {"id": "nasdaq", "label": "Wie nah ist SpaceX an einer möglichen Nasdaq-100-Aufnahme?"},
+    ),
+}
+
+ASSISTANT_SYSTEM_PROMPT = """
+Du bist der Market Signal Assistant eines Research-Dashboards.
+Antworte auf Deutsch, präzise und verständlich. Verwende ausschließlich den bereitgestellten Dashboard-Kontext.
+Erfinde keine Nachrichten, Kurse, Termine oder Indexentscheidungen. Trenne klar zwischen beobachteten Daten,
+heuristischen Scores und nicht bestätigten Annahmen. Formuliere keine Anlageempfehlung und kein Kauf- oder
+Verkaufssignal. Nenne bei Bedarf explizit die Grenzen der Datenbasis. Antworte in höchstens 180 Wörtern.
+""".strip()
 
 # Relevante Nasdaq-Schließtage 2026. Für spätere Jahre ergänzen.
 NASDAQ_MARKET_HOLIDAYS_2026 = {
@@ -448,6 +481,50 @@ def inject_global_css() -> None:
                 color: #e0d6c3;
                 font-size: 0.82rem;
                 line-height: 1.55;
+            }
+
+            .lab-assistant-strip {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 1rem;
+                margin: 1rem 0 0.9rem 0;
+                padding: 0.86rem 1rem;
+                border: 1px solid rgba(103, 232, 249, 0.15);
+                border-radius: 16px;
+                background: linear-gradient(135deg, rgba(15, 35, 59, 0.86), rgba(10, 24, 42, 0.78));
+            }
+
+            .lab-assistant-strip strong {
+                color: #eaf8ff;
+                font-size: 0.93rem;
+            }
+
+            .lab-assistant-strip span {
+                color: #9fb4c9;
+                font-size: 0.8rem;
+            }
+
+            .lab-assistant-answer {
+                margin-top: 0.55rem;
+                padding: 0.78rem 0.86rem;
+                border: 1px solid rgba(142, 180, 219, 0.16);
+                border-radius: 13px;
+                background: rgba(8, 20, 35, 0.64);
+            }
+
+            .lab-assistant-mode {
+                display: inline-flex;
+                margin-bottom: 0.55rem;
+                padding: 0.22rem 0.46rem;
+                border: 1px solid rgba(130, 165, 200, 0.18);
+                border-radius: 999px;
+                color: #aac7df;
+                background: rgba(15, 31, 52, 0.68);
+                font-size: 0.67rem;
+                font-weight: 760;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
             }
 
             .lab-asset-header {
@@ -880,6 +957,288 @@ def render_status_box(title: str, description: str, level: str = "info") -> None
 
 def format_check(condition: bool) -> str:
     return "✅ Erfüllt" if bool(condition) else "❌ Fehlt"
+
+
+def get_optional_secret(name: str, default: str | None = None) -> str | None:
+    """Liest ein optionales Streamlit-Secret, ohne lokale Starts ohne secrets.toml zu blockieren."""
+
+    try:
+        value = st.secrets[name]
+    except Exception:
+        return default
+
+    return str(value) if value is not None else default
+
+
+def assistant_openai_available() -> bool:
+    return OpenAI is not None and bool(get_optional_secret("OPENAI_API_KEY"))
+
+
+def build_assistant_cache_key(asset: str, question_id: str, context: dict) -> str:
+    serialized = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+    return f"{asset}:{question_id}:{digest}"
+
+
+def build_btc_assistant_context(latest: pd.Series, analysis: pd.DataFrame, latest_date: date) -> dict:
+    price = float(latest["Close"])
+    rsi = float(latest["RSI"])
+    drawdown = float(latest["DRAWDOWN"])
+    vol_ratio = float(latest["VOL_RATIO"])
+    macd_above_signal = bool(float(latest["MACD"]) > float(latest["MACD_SIGNAL"]))
+    price_above_ema20 = bool(price > float(latest["EMA20"]))
+    rsi_rising = bool(rsi > float(analysis.iloc[-4]["RSI"]))
+    watch_live = bool(latest["WATCH_SIGNAL"])
+    early_live = bool(latest["EARLY_SIGNAL"])
+
+    if early_live:
+        status = "EARLY"
+    elif watch_live:
+        status = "WATCH"
+    else:
+        status = "NEUTRAL"
+
+    return {
+        "asset": "Bitcoin",
+        "ticker": BTC_TICKER,
+        "data_frequency": "vollständige Tageskerzen",
+        "latest_date": latest_date.isoformat(),
+        "price_usd": round(price, 2),
+        "status": status,
+        "watch_signal_active": watch_live,
+        "early_signal_active": early_live,
+        "rsi14": round(rsi, 2),
+        "drawdown_from_ath_pct": round(drawdown, 2),
+        "volume_ratio": round(vol_ratio, 3),
+        "setup_score": int(latest["SETUP_SCORE"]),
+        "confirmation_score": int(latest["CONFIRMATION_SCORE"]),
+        "conditions": {
+            "drawdown_below_minus_40_pct": drawdown < -40,
+            "rsi14_below_30": rsi < 30,
+            "macd_above_signal": macd_above_signal,
+            "volume_at_least_1_3x": vol_ratio >= 1.3,
+            "price_above_ema20": price_above_ema20,
+            "rsi_rising_vs_3_days_ago": rsi_rising,
+        },
+        "methodology_note": "WATCH benötigt Drawdown unter -40 % und RSI14 unter 30. EARLY benötigt zusätzlich MACD über Signallinie.",
+    }
+
+
+def build_spcx_assistant_context(
+    latest: pd.Series,
+    timeline: dict[str, date],
+    completed_trade_days: int,
+    advt_proxy: float | None,
+    advt_completed_days: int,
+    market_phase: str,
+    current_index_timing_score: int,
+    latest_tactical_score: int,
+) -> dict:
+    rsi_constructive = bool(pd.notna(latest["RSI7"]) and 45 <= float(latest["RSI7"]) <= 68)
+    up_volume_constructive = bool(
+        pd.notna(latest["UP_DOWN_VOLUME_RATIO"]) and float(latest["UP_DOWN_VOLUME_RATIO"]) >= 1.1
+    )
+
+    return {
+        "asset": "SpaceX",
+        "ticker": SPCX_TICKER,
+        "data_frequency": "vollständige reguläre US-Stundenkerzen",
+        "last_regular_close_usd": round(float(latest["Close"]), 2),
+        "ipo_price_usd": SPCX_IPO_PRICE_USD,
+        "ipo_premium_pct": round(float(latest["IPO_PREMIUM"]), 2),
+        "drawdown_from_post_ipo_high_pct": round(float(latest["DRAWDOWN_FROM_HIGH"]), 2),
+        "distance_to_ipo_avwap_pct": round(float(latest["DISTANCE_TO_AVWAP"]), 2),
+        "market_phase": market_phase,
+        "hype_risk_score": int(latest["HYPE_RISK_SCORE"]),
+        "entry_quality_score": int(latest["ENTRY_QUALITY_SCORE"]),
+        "index_timing_score": current_index_timing_score,
+        "tactical_score": latest_tactical_score,
+        "tactical_entry_watch": bool(latest["TACTICAL_ENTRY_WATCH"]),
+        "conditions": {
+            "moderate_pullback_from_post_ipo_high": -25 <= float(latest["DRAWDOWN_FROM_HIGH"]) <= -8,
+            "price_at_or_above_ipo_price": float(latest["Close"]) >= SPCX_IPO_PRICE_USD,
+            "price_above_ipo_anchored_vwap": bool(latest["ABOVE_AVWAP"]),
+            "ema9_above_ema21": bool(latest["EMA_BULL_STRUCTURE"]),
+            "short_term_higher_low": bool(latest["HIGHER_LOW"]),
+            "volatility_cooling": bool(latest["VOLATILITY_COOLING"]),
+            "rsi7_constructive_range_45_to_68": rsi_constructive,
+            "up_volume_exceeds_down_volume": up_volume_constructive,
+        },
+        "nasdaq_100_fast_entry": {
+            "official_fast_entry_announced": SPCX_OFFICIAL_FAST_ENTRY_ANNOUNCED,
+            "top40_full_market_cap_confirmed": SPCX_TOP40_FULL_MARKET_CAP_CONFIRMED,
+            "completed_trading_days": completed_trade_days,
+            "reference_day_7": timeline["reference"].isoformat(),
+            "possible_announcement_day_10": timeline["expected_announcement"].isoformat(),
+            "possible_effective_day_15": timeline["expected_effective"].isoformat(),
+            "advt_proxy_usd": None if advt_proxy is None else round(float(advt_proxy), 2),
+            "advt_completed_days": advt_completed_days,
+            "advt_threshold_met": None if advt_proxy is None else bool(advt_proxy >= 5_000_000),
+        },
+        "methodology_note": "Die Nasdaq-100-Termine sind methodikbasierte Erwartungstermine, solange keine offizielle Mitteilung hinterlegt ist.",
+    }
+
+
+def local_assistant_answer(asset: str, question_id: str, context: dict) -> str:
+    """Deterministische Vorschau-Antworten, damit der Chatbot auch ohne API-Key live funktioniert."""
+
+    if asset == "bitcoin":
+        conditions = context["conditions"]
+        if question_id == "status":
+            return (
+                f"Der BTC-Status lautet aktuell **{context['status']}**. Der letzte vollständig ausgewertete Schlusskurs liegt bei "
+                f"**{context['price_usd']:,.0f} USD**. Der RSI14 beträgt **{context['rsi14']:.1f}**, der Drawdown vom bisherigen ATH "
+                f"**{context['drawdown_from_ath_pct']:.1f} %**. Der Setup-Score liegt bei **{context['setup_score']}/100**, "
+                f"der Bestätigungs-Score bei **{context['confirmation_score']}/100**. "
+                "Das ist eine heuristische Research-Einordnung und kein automatisches Kaufsignal."
+            )
+        if question_id == "missing":
+            required = [
+                ("Drawdown unter -40 %", conditions["drawdown_below_minus_40_pct"]),
+                ("RSI14 unter 30", conditions["rsi14_below_30"]),
+                ("MACD über Signallinie", conditions["macd_above_signal"]),
+            ]
+            missing = [label for label, fulfilled in required if not fulfilled]
+            if not missing:
+                return "Die drei Pflichtbedingungen für ein EARLY-Signal sind aktuell erfüllt. Das Modell zeigt damit eine bullische Frühbestätigung, aber keine Anlageempfehlung."
+            return "Für ein EARLY-Signal fehlen aktuell noch: **" + ", ".join(missing) + "**. Zusatzsignale wie Volumen, EMA20 und steigender RSI helfen bei der Einordnung, sind aber keine Pflichtbedingungen."
+        return (
+            f"Der **Setup-Score** von **{context['setup_score']}/100** misst die Intensität der Stress- und Bodenbildungsphase, insbesondere Drawdown, RSI und Volumen. "
+            f"Der **Bestätigungs-Score** von **{context['confirmation_score']}/100** prüft, ob Momentum und kurzfristige Struktur bereits nach oben drehen, unter anderem über MACD, EMA20 und RSI-Verlauf. "
+            "Beide Scores beantworten daher unterschiedliche Fragen und sollten nicht isoliert gelesen werden."
+        )
+
+    conditions = context["conditions"]
+    ndx = context["nasdaq_100_fast_entry"]
+    if question_id == "status":
+        return (
+            f"Das SpaceX-Modell ordnet die aktuelle Phase als **{context['market_phase']}** ein. Der letzte reguläre Schlusskurs liegt bei "
+            f"**{context['last_regular_close_usd']:,.2f} USD**. Das Hype-Risiko beträgt **{context['hype_risk_score']}/100**, die Einstiegsqualität "
+            f"**{context['entry_quality_score']}/100** und der taktische Score **{context['tactical_score']}/100**. "
+            "Der taktische Score kombiniert Kursstruktur und Index-Timing, ersetzt aber keine eigenständige Risikoprüfung."
+        )
+    if question_id == "missing":
+        labels = {
+            "moderate_pullback_from_post_ipo_high": "moderater Rücksetzer vom Post-IPO-Hoch",
+            "price_at_or_above_ipo_price": "Kurs mindestens auf IPO-Niveau",
+            "price_above_ipo_anchored_vwap": "Kurs oberhalb des IPO-anchored VWAP",
+            "ema9_above_ema21": "EMA9 oberhalb EMA21",
+            "short_term_higher_low": "kurzfristig höheres Tief",
+            "volatility_cooling": "abkühlende Volatilität",
+            "rsi7_constructive_range_45_to_68": "RSI7 im konstruktiven Bereich",
+            "up_volume_exceeds_down_volume": "überwiegendes Aufwärtsvolumen",
+        }
+        missing = [labels[key] for key, fulfilled in conditions.items() if not fulfilled]
+        if not missing:
+            return "Alle aktuell modellierten Strukturkriterien sind erfüllt. Das erhöht die Einstiegsqualität im Modell, ist aber weiterhin kein automatisches Kaufsignal."
+        return "Für ein konstruktiveres Einstiegsfenster fehlen aktuell noch: **" + ", ".join(missing) + "**. Die Kriterien sind transparente heuristische Startwerte und noch nicht statistisch kalibriert."
+    official = "ja" if ndx["official_fast_entry_announced"] else "nein"
+    top40 = "bestätigt" if ndx["top40_full_market_cap_confirmed"] is True else "noch nicht bestätigt"
+    advt = "noch nicht belastbar" if ndx["advt_proxy_usd"] is None else f"ca. {ndx['advt_proxy_usd']:,.0f} USD"
+    return (
+        f"Aktuell sind **{ndx['completed_trading_days']}** Handelstage seit dem IPO abgeschlossen. Der methodikbasierte 7. Handelstag ist "
+        f"**{ndx['reference_day_7']}**, eine mögliche Ankündigung nach dem 10. Handelstag **{ndx['possible_announcement_day_10']}** und eine mögliche Aufnahme nach 15 Handelstagen "
+        f"**{ndx['possible_effective_day_15']}**. Offizielle Fast-Entry-Ankündigung hinterlegt: **{official}**. "
+        f"Top-40-Full-Market-Cap: **{top40}**. ADVT-Näherung: **{advt}**. Solange Nasdaq keine Mitteilung veröffentlicht hat, bleibt die Aufnahme offen."
+    )
+
+
+def openai_assistant_answer(asset: str, question_label: str, context: dict, fallback_answer: str) -> tuple[str, str]:
+    api_key = get_optional_secret("OPENAI_API_KEY")
+    if OpenAI is None or not api_key:
+        return fallback_answer, "Preview-Modus ohne API"
+
+    model = get_optional_secret("OPENAI_MODEL", ASSISTANT_DEFAULT_MODEL) or ASSISTANT_DEFAULT_MODEL
+    prompt_payload = {
+        "asset": asset,
+        "selected_question": question_label,
+        "dashboard_context": context,
+        "deterministic_reference_answer": fallback_answer,
+    }
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=model,
+            instructions=ASSISTANT_SYSTEM_PROMPT,
+            input=json.dumps(prompt_payload, ensure_ascii=False, default=str),
+            max_output_tokens=450,
+            store=False,
+        )
+        answer = str(response.output_text).strip()
+        return (answer or fallback_answer), f"KI-Modus · {model}"
+    except Exception:
+        return fallback_answer, "Fallback nach API-Fehler"
+
+
+def render_market_assistant(asset: str, context: dict) -> None:
+    """Rendert eine begrenzte, erweiterbare Chatbot-Vorschau mit drei Fragen je Asset."""
+
+    questions = ASSISTANT_QUESTIONS[asset]
+    state_key = f"assistant_last_answer_{asset}"
+    cache_key = "assistant_response_cache"
+    count_key = "assistant_api_call_count"
+
+    st.session_state.setdefault(cache_key, {})
+    st.session_state.setdefault(count_key, 0)
+
+    st.markdown(
+        """
+        <div class="lab-assistant-strip">
+            <div>
+                <strong>💬 Market Signal Assistant</strong><br>
+                <span>MVP mit drei kontextbezogenen Fragen. Die Architektur bleibt für freie Texteingaben erweiterbar.</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if hasattr(st, "popover"):
+        assistant_container = st.popover("💬 Assistent öffnen", use_container_width=True)
+    else:
+        assistant_container = st.expander("💬 Assistent öffnen")
+
+    with assistant_container:
+        st.caption("Wähle eine exemplarische Frage. Die Antwort berücksichtigt die aktuell angezeigten Dashboard-Werte.")
+
+        for question in questions:
+            if st.button(question["label"], key=f"assistant_{asset}_{question['id']}", use_container_width=True):
+                cache_identifier = build_assistant_cache_key(asset, question["id"], context)
+                cached = st.session_state[cache_key].get(cache_identifier)
+
+                if cached is not None:
+                    st.session_state[state_key] = cached
+                    continue
+
+                fallback_answer = local_assistant_answer(asset, question["id"], context)
+                can_call_api = assistant_openai_available() and st.session_state[count_key] < ASSISTANT_MAX_API_CALLS_PER_SESSION
+
+                if can_call_api:
+                    with st.spinner("KI-Antwort wird erstellt ..."):
+                        answer, mode = openai_assistant_answer(asset, question["label"], context, fallback_answer)
+                    st.session_state[count_key] += 1
+                elif assistant_openai_available():
+                    answer, mode = fallback_answer, "Preview-Modus · Sitzungslimit erreicht"
+                else:
+                    answer, mode = fallback_answer, "Preview-Modus ohne API"
+
+                response_payload = {
+                    "question": question["label"],
+                    "answer": answer,
+                    "mode": mode,
+                }
+                st.session_state[cache_key][cache_identifier] = response_payload
+                st.session_state[state_key] = response_payload
+
+        latest_response = st.session_state.get(state_key)
+        if latest_response:
+            st.markdown(f'<span class="lab-assistant-mode">{latest_response["mode"]}</span>', unsafe_allow_html=True)
+            st.markdown(f"**{latest_response['question']}**")
+            st.markdown(latest_response["answer"])
+
+        if st.button("Antwort zurücksetzen", key=f"assistant_reset_{asset}", use_container_width=True):
+            st.session_state.pop(state_key, None)
 
 
 # ============================================================
@@ -1451,6 +1810,9 @@ def render_bitcoin_page() -> None:
         )
     else:
         render_status_box("NEUTRAL", "Aktuell ist kein qualifiziertes bullisches Frühwarnsignal aktiv.", "info")
+
+    btc_assistant_context = build_btc_assistant_context(latest, analysis, latest_date)
+    render_market_assistant("bitcoin", btc_assistant_context)
 
     st.subheader("Checkliste bis zur bullischen Frühbestätigung")
     checklist = pd.DataFrame(
@@ -2143,6 +2505,18 @@ def render_spacex_page() -> None:
     metric_row_2[3].metric("Taktischer Score", f"{latest_tactical_score}/100")
 
     render_status_box(market_phase, market_phase_description, market_phase_level)
+
+    spcx_assistant_context = build_spcx_assistant_context(
+        latest=latest,
+        timeline=timeline,
+        completed_trade_days=completed_trade_days,
+        advt_proxy=advt_proxy,
+        advt_completed_days=advt_completed_days,
+        market_phase=market_phase,
+        current_index_timing_score=current_index_timing_score,
+        latest_tactical_score=latest_tactical_score,
+    )
+    render_market_assistant("spacex", spcx_assistant_context)
 
     st.subheader("Nasdaq-100 Fast-Entry-Watch")
     if SPCX_OFFICIAL_FAST_ENTRY_ANNOUNCED:

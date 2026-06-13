@@ -5,3 +5,4 @@ venv/
 main_backup.py
 main_v2.py
 bullish_early_signals.csv
+.streamlit/secrets.toml
